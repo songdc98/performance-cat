@@ -6,6 +6,8 @@ A tiny, native **macOS performance dashboard** for Apple Silicon. One always-on
 window that shows what your Mac is doing right now — CPU, power, temperature,
 fans, memory, network, storage and battery — in a clean, Apple-style dark UI.
 
+![Performance Cat dashboard screenshot](assets/screenshot.png)
+
 It is built with plain **AppKit in a single Swift file**. No Electron, no web
 view, no background daemon, no network access, no analytics, no language switcher
 inside the app. It only *reads* local system metrics and draws them.
