@@ -1,0 +1,14 @@
+# Build output
+dist/
+build/
+*.app
+
+# Internal handoff notes (not part of the public project)
+CLOUDCODE_HANDOFF.md
+
+# macOS
+.DS_Store
+
+# Hand-off / release artifacts (not part of the public repo)
+PUSH_INSTRUCTIONS.md
+*.zip
