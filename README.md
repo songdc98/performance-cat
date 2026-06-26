@@ -37,7 +37,7 @@ Every value is labeled so you always know what you are looking at.
 | **CPU** | Total load %, user/system/idle split, chip name, CPU temperature, live sparkline |
 | **Power** | System power (W), SoC total, and the CPU / GPU / ANE / DRAM breakdown, thermal state |
 | **Cooling** | **Real per-fan RPM read from the SMC** (shows `0 RPM` when the fans are off), plus CPU/GPU temperature. Falls back to a thermal panel on fanless Macs |
-| **Memory** | Used / total, pressure %, swap, free, **plus the top 3 memory-using apps**. The "used" figure matches Activity Monitor's *Memory Used* (see note below) |
+| **Memory** | Used / total, pressure %, swap, free, **plus the top 3 memory-using apps** |
 | **Network** | Live up/down throughput and the **top 3 processes by traffic** (per second) |
 | **Storage** | Apple-style breakdown of the boot volume: **System / Data / Other / Free**, from `diskutil` |
 | **Battery** | Charge %, charge/discharge wattage, adapter wattage, cycle count |
@@ -63,25 +63,6 @@ fabricates data:
   helper, launched as a child process and parsed from its JSON output.
 - **Per-process network** — `nettop`, sampled briefly on a background thread.
 - **Storage breakdown** — `diskutil apfs list`, sampled about once every 5 min.
-
-### Which "memory used" number is correct?
-
-Activity Monitor, this app, and tools like Stats often show *different* memory
-numbers — because there is no single definition of "used" on macOS:
-
-- **`Total − Free` is misleading.** macOS keeps "free" RAM full of file caches it
-  can drop instantly, so that number looks alarmingly high (~40% here) and means
-  little.
-- The meaningful figure is **App Memory + Wired + Compressed** — memory that is
-  actually committed and can't be reclaimed for free. This is exactly what
-  Activity Monitor calls **"Memory Used"** and what its memory-pressure graph is
-  based on.
-
-Performance Cat reports that same App + Wired + Compressed figure (via `macmon`),
-so it lines up with Activity Monitor's "Memory Used". If another tool shows a
-different number, it is using a different definition — not a more accurate one.
-
----
 
 ## Requirements
 
