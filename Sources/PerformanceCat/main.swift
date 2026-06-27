@@ -62,15 +62,15 @@ struct Strings {
         vitalRAM: "内存",
         titleCPU: "处理器", titlePower: "功率", titleRAM: "内存", titleFan: "散热", titleNet: "网络",
         titleStorage: "存储空间", titleBattery: "电池", titleAI: "AI 工具", titleProc: "活跃进程",
-        subPower: "SoC · 系统功率 · 温度", subRAM: "统一内存 · 同活动监视器口径", subNet: "本机吞吐 · 进程流量",
-        subStorage: "Macintosh HD · 分类占用", subAI: "Codex · Claude 进程", subProc: "CPU 占用排名", subFanNone: "风扇由系统托管",
+        subPower: "SoC 功率 · 系统功率 · 温度", subRAM: "统一内存 · 同活动监视器口径", subNet: "本机吞吐 · 进程流量",
+        subStorage: "Macintosh HD · 分类占用", subAI: "Codex · Claude 进程", subProc: "CPU / GPU 占用排名", subFanNone: "风扇由系统托管",
         subFan: { "\($0) 风扇 · 系统自动调速" },
         cpuUser: "用户", cpuSystem: "系统", cpuIdle: "闲置",
         powerSystem: "系统功率", thermalStatus: "温度状态",
         thermalText: { switch $0 { case .nominal: return "正常"; case .fair: return "温和"; case .serious: return "偏热"; case .critical: return "临界"; case .unknown: return "未知" } },
         fanLabel: { "风扇 \($0)" },
         fanStatus: "状态", fanNoteIdle: "低温停转 · 由系统按温度自动调速", fanNoteLive: "实测转速 · 由系统按温度自动调速", fanNoneNote: "此机型未暴露风扇转速（或无风扇）",
-        memPressure: "压力", memFree: "可用", memTop3: "内存占用前三（应用）", measuring: "统计中…",
+        memPressure: "压力", memFree: "可用", memTop3: "内存占用前三（进程/应用）", measuring: "统计中…",
         netTop3: "流量占用前三（进程，每秒）", netNone: "暂无明显进程流量",
         storSystem: "系统", storData: "数据", storOther: "其他", storFree: "可用",
         storFreeOfTotal: { "可用 / 共 \($0)" },
@@ -93,15 +93,15 @@ struct Strings {
         vitalRAM: "RAM",
         titleCPU: "CPU", titlePower: "Power", titleRAM: "Memory", titleFan: "Cooling", titleNet: "Network",
         titleStorage: "Storage", titleBattery: "Battery", titleAI: "AI Tools", titleProc: "Top Processes",
-        subPower: "SoC · system · temp", subRAM: "Unified memory · like Activity Monitor", subNet: "Throughput · per-process",
-        subStorage: "Macintosh HD · by category", subAI: "Codex · Claude processes", subProc: "By CPU usage", subFanNone: "Fans managed by macOS",
+        subPower: "SoC power · system power · temp", subRAM: "Unified memory · like Activity Monitor", subNet: "Throughput · per-process",
+        subStorage: "Macintosh HD · by category", subAI: "Codex · Claude processes", subProc: "CPU / GPU usage", subFanNone: "Fans managed by macOS",
         subFan: { "\($0) fans · auto-managed" },
         cpuUser: "User", cpuSystem: "System", cpuIdle: "Idle",
         powerSystem: "System power", thermalStatus: "Thermal",
         thermalText: { switch $0 { case .nominal: return "Nominal"; case .fair: return "Fair"; case .serious: return "Serious"; case .critical: return "Critical"; case .unknown: return "Unknown" } },
         fanLabel: { "Fan \($0)" },
         fanStatus: "Status", fanNoteIdle: "Idle (cool) · system auto-managed", fanNoteLive: "Live RPM · system auto-managed", fanNoneNote: "No fan sensor on this Mac (or fanless)",
-        memPressure: "Pressure", memFree: "Free", memTop3: "Top 3 apps by memory", measuring: "Measuring…",
+        memPressure: "Pressure", memFree: "Free", memTop3: "Top 3 by memory (process/app)", measuring: "Measuring…",
         netTop3: "Top 3 processes by traffic (per sec)", netNone: "No notable process traffic",
         storSystem: "System", storData: "Data", storOther: "Other", storFree: "Free",
         storFreeOfTotal: { "free / \($0) total" },
@@ -876,8 +876,9 @@ final class MetricsProvider {
 
         guard !processes.isEmpty else { return nil }
         let top = Array(processes.sorted { $0.cpu > $1.cpu }.prefix(6))
-        // Top three memory-using applications.
-        let memApps = apps.filter { $0.value.isUserApp }
+        // Top memory users across GUI apps and command-line processes. Filtering
+        // only /Applications hides Python, local ML jobs, and other real load.
+        let memApps = apps
             .sorted { $0.value.rss > $1.value.rss }.prefix(3)
             .map { AppUsage(name: $0.key, rss: $0.value.rss, cpu: $0.value.cpu) }
 
@@ -950,8 +951,8 @@ final class DashboardView: NSView {
     func update(_ snapshot: MetricsSnapshot) {
         self.snapshot = snapshot
         append(&cpuHistory, snapshot.cpu.active)
-        let systemPower = snapshot.sensors.systemPowerW ?? snapshot.sensors.allPowerW ?? snapshot.battery.watts ?? 0
-        append(&powerHistory, min(1, systemPower / 120.0))
+        let socPower = snapshot.sensors.allPowerW ?? componentPower(snapshot.sensors) ?? snapshot.sensors.systemPowerW ?? snapshot.battery.watts ?? 0
+        append(&powerHistory, min(1, socPower / 100.0))
         append(&netHistory, min(1, (snapshot.network.downPerSecond + snapshot.network.upPerSecond) / (25.0 * 1024.0 * 1024.0)))
         renderToLayer()
     }
@@ -1052,7 +1053,7 @@ final class DashboardView: NSView {
 
     private func statusSeverity(_ s: MetricsSnapshot) -> Severity {
         let ramRatio = s.memory.ratio
-        let power = s.sensors.systemPowerW ?? s.sensors.allPowerW ?? 0
+        let power = s.sensors.allPowerW ?? componentPower(s.sensors) ?? s.sensors.systemPowerW ?? 0
         if s.thermalState == .critical { return Severity(word: S.statusThermal, color: crit) }
         if s.thermalState == .serious { return Severity(word: S.statusThermal, color: warn) }
         if s.cpu.active > 0.75 { return Severity(word: S.statusCPU, color: warn) }
@@ -1122,11 +1123,11 @@ final class DashboardView: NSView {
     private func drawPower(_ s: MetricsSnapshot, rect: NSRect) {
         drawCard(rect)
         drawSectionTitle(S.titlePower, subtitle: S.subPower, rect: rect, glyph: .power)
-        let systemPower = s.sensors.systemPowerW ?? s.sensors.allPowerW ?? (s.battery.watts.flatMap { $0 > 0.2 ? $0 : nil })
-        drawNumberUnit(systemPower.map { fmt($0, 1) } ?? "—", unit: "W", numberFont: heroFont(30), unitFont: tabFont(14, .medium),
+        let socPower = s.sensors.allPowerW ?? componentPower(s.sensors)
+        drawNumberUnit(socPower.map { fmt($0, 1) } ?? "—", unit: "W", numberFont: heroFont(30), unitFont: tabFont(14, .medium),
                        numberColor: pwrHue, unitColor: textTertiary, at: NSPoint(x: rect.minX + 18, y: rect.minY + 46))
-        let socText = s.sensors.allPowerW.map { "\(S.powerSystem) · SoC \(fmt($0, 1)) W" } ?? S.powerSystem
-        drawText(socText, in: NSRect(x: rect.minX + 18, y: rect.minY + 82, width: rect.width - 36, height: 16),
+        let systemText = s.sensors.systemPowerW.map { "\(S.powerSystem) \(fmt($0, 1)) W" } ?? S.powerSystem
+        drawText(systemText, in: NSRect(x: rect.minX + 18, y: rect.minY + 82, width: rect.width - 36, height: 16),
                  size: 11, weight: .regular, color: textTertiary)
         drawSparkline(powerHistory, rect: NSRect(x: rect.minX + 18, y: rect.minY + 102, width: rect.width - 36, height: 30), hue: pwrHue)
         let colGap: CGFloat = 14
@@ -1313,9 +1314,12 @@ final class DashboardView: NSView {
     private func drawProcesses(_ s: MetricsSnapshot, rect: NSRect) {
         drawCard(rect)
         drawSectionTitle(S.titleProc, subtitle: S.subProc, rect: rect, glyph: .proc)
-        let items = Array(s.topProcesses.prefix(5))
+        drawText(appLang == .en ? "CPU top 3" : "CPU 前三",
+                 in: NSRect(x: rect.minX + 18, y: rect.minY + 48, width: rect.width - 36, height: 14),
+                 size: 10.5, weight: .medium, color: textTertiary)
+        let items = Array(s.topProcesses.prefix(3))
         let maxCPU = max(0.1, items.map { $0.cpu }.max() ?? 0.1)
-        var y = rect.minY + 50
+        var y = rect.minY + 68
         for item in items {
             drawText(item.name, in: NSRect(x: rect.minX + 18, y: y, width: rect.width - 92, height: 16),
                      font: NSFont.systemFont(ofSize: 12, weight: .regular), color: textPrimary)
@@ -1329,6 +1333,19 @@ final class DashboardView: NSView {
             procHue.setFill(); fg.fill()
             y += 29
         }
+
+        let gpuY = rect.minY + 170
+        drawText(appLang == .en ? "GPU top 3" : "GPU 前三",
+                 in: NSRect(x: rect.minX + 18, y: gpuY, width: rect.width - 36, height: 14),
+                 size: 10.5, weight: .medium, color: textTertiary)
+        drawMetricRow(appLang == .en ? "Per-process GPU" : "进程级 GPU",
+                      value: appLang == .en ? "needs sudo" : "需 sudo",
+                      dot: chGPU,
+                      rect: NSRect(x: rect.minX + 18, y: gpuY + 22, width: rect.width - 36, height: 16),
+                      valueColor: textTertiary)
+        let gpuNote = appLang == .en ? "Disabled to keep the app light and unprivileged" : "为保持轻量和无特权常驻，未启用"
+        drawText(gpuNote, in: NSRect(x: rect.minX + 18, y: gpuY + 44, width: rect.width - 36, height: 30),
+                 size: 10.5, weight: .regular, color: textTertiary)
     }
 
     // MARK: Chrome helpers
@@ -1643,6 +1660,12 @@ final class DashboardView: NSView {
         guard let value else { return "—" }
         if value < 0.05 { return "0.0 W" }
         return "\(fmt(value, 1)) W"
+    }
+
+    private func componentPower(_ sensors: SensorStats) -> Double? {
+        let values = [sensors.cpuPowerW, sensors.gpuPowerW, sensors.anePowerW, sensors.ramPowerW].compactMap { $0 }
+        guard !values.isEmpty else { return nil }
+        return values.reduce(0, +)
     }
 
     private func formatBytes(_ bytes: UInt64) -> String {
