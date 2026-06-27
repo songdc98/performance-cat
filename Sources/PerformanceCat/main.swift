@@ -120,6 +120,73 @@ struct Strings {
 
 let S: Strings = appLang == .en ? .english : .chinese
 
+// Runs short-lived system tools with a hard timeout. Without this, one stuck
+// ps/nettop/diskutil child can permanently freeze the sampler loop.
+enum ProcessOutput {
+    static func string(_ executable: String, _ arguments: [String], timeout: TimeInterval) -> String? {
+        guard let data = data(executable, arguments, timeout: timeout) else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    static func data(_ executable: String, _ arguments: [String], timeout: TimeInterval) -> Data? {
+        let process = Process()
+        let stdout = Pipe()
+        let stderr = Pipe()
+        var output = Data()
+        let lock = NSLock()
+        let finished = DispatchSemaphore(value: 0)
+
+        func append(_ data: Data) {
+            guard !data.isEmpty else { return }
+            lock.lock()
+            output.append(data)
+            lock.unlock()
+        }
+
+        stdout.fileHandleForReading.readabilityHandler = { handle in append(handle.availableData) }
+        stderr.fileHandleForReading.readabilityHandler = { handle in _ = handle.availableData }
+
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+        process.standardOutput = stdout
+        process.standardError = stderr
+        process.terminationHandler = { _ in finished.signal() }
+
+        do {
+            try process.run()
+        } catch {
+            stdout.fileHandleForReading.readabilityHandler = nil
+            stderr.fileHandleForReading.readabilityHandler = nil
+            return nil
+        }
+
+        let timeoutMs = max(1, Int(timeout * 1000))
+        let timedOut = finished.wait(timeout: .now() + .milliseconds(timeoutMs)) == .timedOut
+        var exited = !timedOut
+        if timedOut {
+            process.terminate()
+            if finished.wait(timeout: .now() + .milliseconds(500)) == .success {
+                exited = true
+            } else {
+                kill(process.processIdentifier, SIGKILL)
+                exited = finished.wait(timeout: .now() + .milliseconds(500)) == .success
+            }
+        }
+
+        stdout.fileHandleForReading.readabilityHandler = nil
+        stderr.fileHandleForReading.readabilityHandler = nil
+        guard exited else { return nil }
+        append(stdout.fileHandleForReading.readDataToEndOfFile())
+        _ = stderr.fileHandleForReading.readDataToEndOfFile()
+
+        guard !timedOut, process.terminationStatus == 0 else { return nil }
+        lock.lock()
+        let result = output
+        lock.unlock()
+        return result
+    }
+}
+
 // MARK: - Models
 
 struct CPUStats {
@@ -456,21 +523,12 @@ final class NetTopReader {
 
     // Two cumulative frames 1s apart; per-process delta = bytes/second.
     private func sampleOnce() -> [NetworkApp]? {
-        let process = Process()
-        let pipe = Pipe()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/nettop")
-        process.arguments = ["-P", "-x", "-L", "2", "-s", "1", "-J", "bytes_in,bytes_out"]
-        process.standardOutput = pipe
-        process.standardError = Pipe()
-        do {
-            try process.run()
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            process.waitUntilExit()
-            guard let text = String(data: data, encoding: .utf8) else { return nil }
-            return Self.parse(text)
-        } catch {
-            return nil
-        }
+        guard let text = ProcessOutput.string(
+            "/usr/bin/nettop",
+            ["-P", "-x", "-L", "2", "-s", "1", "-J", "bytes_in,bytes_out"],
+            timeout: 5.0
+        ) else { return nil }
+        return Self.parse(text)
     }
 
     private static func parse(_ text: String) -> [NetworkApp] {
@@ -540,20 +598,8 @@ final class StorageReader {
     }
 
     private func sampleOnce() -> StorageBreakdown? {
-        let process = Process()
-        let pipe = Pipe()
-        process.executableURL = URL(fileURLWithPath: "/usr/sbin/diskutil")
-        process.arguments = ["apfs", "list", "-plist"]
-        process.standardOutput = pipe
-        process.standardError = Pipe()
-        do {
-            try process.run()
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            process.waitUntilExit()
-            return Self.parse(data)
-        } catch {
-            return nil
-        }
+        guard let data = ProcessOutput.data("/usr/sbin/diskutil", ["apfs", "list", "-plist"], timeout: 8.0) else { return nil }
+        return Self.parse(data)
     }
 
     private static func parse(_ data: Data) -> StorageBreakdown? {
@@ -600,10 +646,11 @@ final class MetricsProvider {
     func snapshot() -> MetricsSnapshot {
         let now = Date()
         if now.timeIntervalSince(processReadTime) > 4 {
-            let data = Self.readProcesses()
-            cachedProcesses = data.top
-            cachedMemApps = data.memApps
-            cachedAIUsage = data.ai
+            if let data = Self.readProcesses() {
+                cachedProcesses = data.top
+                cachedMemApps = data.memApps
+                cachedAIUsage = data.ai
+            }
             processReadTime = now
         }
         return MetricsSnapshot(
@@ -695,26 +742,15 @@ final class MetricsProvider {
     }
 
     private static func readSwapUsage() -> UInt64? {
-        let process = Process()
-        let pipe = Pipe()
-        process.executableURL = URL(fileURLWithPath: "/usr/sbin/sysctl")
-        process.arguments = ["-n", "vm.swapusage"]
-        process.standardOutput = pipe
-        process.standardError = Pipe()
-        do {
-            try process.run()
-            process.waitUntilExit()
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            guard let text = String(data: data, encoding: .utf8) else { return nil }
-            let pattern = #"used = ([0-9.]+)([MG])"#
-            guard let regex = try? NSRegularExpression(pattern: pattern),
-                  let match = regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
-                  let valueRange = Range(match.range(at: 1), in: text),
-                  let unitRange = Range(match.range(at: 2), in: text),
-                  let value = Double(text[valueRange]) else { return nil }
-            let multiplier = text[unitRange] == "G" ? 1024.0 * 1024.0 * 1024.0 : 1024.0 * 1024.0
-            return UInt64(value * multiplier)
-        } catch { return nil }
+        guard let text = ProcessOutput.string("/usr/sbin/sysctl", ["-n", "vm.swapusage"], timeout: 1.5) else { return nil }
+        let pattern = #"used = ([0-9.]+)([MG])"#
+        guard let regex = try? NSRegularExpression(pattern: pattern),
+              let match = regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
+              let valueRange = Range(match.range(at: 1), in: text),
+              let unitRange = Range(match.range(at: 2), in: text),
+              let value = Double(text[valueRange]) else { return nil }
+        let multiplier = text[unitRange] == "G" ? 1024.0 * 1024.0 * 1024.0 : 1024.0 * 1024.0
+        return UInt64(value * multiplier)
     }
 
     private func readNetwork() -> NetworkStats {
@@ -797,55 +833,43 @@ final class MetricsProvider {
     }
 
     // Reads ps once and derives: top CPU processes, the top memory-using apps, and AI-tool usage.
-    private static func readProcesses() -> (top: [ProcessStats], memApps: [AppUsage], ai: AIUsage) {
-        let process = Process()
-        let pipe = Pipe()
-        process.executableURL = URL(fileURLWithPath: "/bin/ps")
-        process.arguments = ["-axo", "pcpu=,rss=,etime=,comm="]
-        process.standardOutput = pipe
-        process.standardError = Pipe()
-        do {
-            try process.run()
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            process.waitUntilExit()
-            guard let output = String(data: data, encoding: .utf8) else { return ([], [], AIUsage()) }
+    private static func readProcesses() -> (top: [ProcessStats], memApps: [AppUsage], ai: AIUsage)? {
+        guard let output = ProcessOutput.string("/bin/ps", ["-axo", "pcpu=,rss=,etime=,comm="], timeout: 2.0) else { return nil }
 
-            var processes: [ProcessStats] = []
-            var ai = AIUsage()
-            // Aggregate by application bundle (so an app's helpers sum together).
-            var apps: [String: (rss: UInt64, cpu: Double, isUserApp: Bool)] = [:]
+        var processes: [ProcessStats] = []
+        var ai = AIUsage()
+        // Aggregate by application bundle (so an app's helpers sum together).
+        var apps: [String: (rss: UInt64, cpu: Double, isUserApp: Bool)] = [:]
 
-            for line in output.split(separator: "\n") {
-                // Fields: pcpu rss etime path. etime ("[[dd-]hh:]mm:ss") has no spaces; the path may.
-                let parts = line.split(separator: " ", maxSplits: 3, omittingEmptySubsequences: true)
-                guard parts.count == 4, let cpu = Double(parts[0]), let rssKB = UInt64(parts[1]) else { continue }
-                let uptime = parseETime(String(parts[2]))
-                let path = String(parts[3])
-                let memory = rssKB * 1024
-                let procName = URL(fileURLWithPath: path).lastPathComponent
-                processes.append(ProcessStats(name: procName, cpu: cpu))
+        for line in output.split(separator: "\n") {
+            // Fields: pcpu rss etime path. etime ("[[dd-]hh:]mm:ss") has no spaces; the path may.
+            let parts = line.split(separator: " ", maxSplits: 3, omittingEmptySubsequences: true)
+            guard parts.count == 4, let cpu = Double(parts[0]), let rssKB = UInt64(parts[1]) else { continue }
+            let uptime = parseETime(String(parts[2]))
+            let path = String(parts[3])
+            let memory = rssKB * 1024
+            let procName = URL(fileURLWithPath: path).lastPathComponent
+            processes.append(ProcessStats(name: procName, cpu: cpu))
 
-                let lower = path.lowercased()
-                if lower.contains("codex") { accumulate(&ai.codex, cpu: cpu, memory: memory, uptime: uptime) }
-                if lower.contains("claude") { accumulate(&ai.claude, cpu: cpu, memory: memory, uptime: uptime) }
+            let lower = path.lowercased()
+            if lower.contains("codex") { accumulate(&ai.codex, cpu: cpu, memory: memory, uptime: uptime) }
+            if lower.contains("claude") { accumulate(&ai.claude, cpu: cpu, memory: memory, uptime: uptime) }
 
-                let app = appName(for: path)
-                let isUserApp = path.contains("/Applications/")
-                var entry = apps[app] ?? (0, 0, false)
-                entry.rss += memory; entry.cpu += cpu; entry.isUserApp = entry.isUserApp || isUserApp
-                apps[app] = entry
-            }
-
-            let top = Array(processes.sorted { $0.cpu > $1.cpu }.prefix(6))
-            // Top three memory-using applications.
-            let memApps = apps.filter { $0.value.isUserApp }
-                .sorted { $0.value.rss > $1.value.rss }.prefix(3)
-                .map { AppUsage(name: $0.key, rss: $0.value.rss, cpu: $0.value.cpu) }
-
-            return (top, memApps, ai)
-        } catch {
-            return ([], [], AIUsage())
+            let app = appName(for: path)
+            let isUserApp = path.contains("/Applications/")
+            var entry = apps[app] ?? (0, 0, false)
+            entry.rss += memory; entry.cpu += cpu; entry.isUserApp = entry.isUserApp || isUserApp
+            apps[app] = entry
         }
+
+        guard !processes.isEmpty else { return nil }
+        let top = Array(processes.sorted { $0.cpu > $1.cpu }.prefix(6))
+        // Top three memory-using applications.
+        let memApps = apps.filter { $0.value.isUserApp }
+            .sorted { $0.value.rss > $1.value.rss }.prefix(3)
+            .map { AppUsage(name: $0.key, rss: $0.value.rss, cpu: $0.value.cpu) }
+
+        return (top, memApps, ai)
     }
 
     private static func accumulate(_ tool: inout AIToolUsage, cpu: Double, memory: UInt64, uptime: Int) {
