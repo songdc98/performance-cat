@@ -154,9 +154,15 @@ enum ProcessOutput {
 
         do {
             try process.run()
+            stdout.fileHandleForWriting.closeFile()
+            stderr.fileHandleForWriting.closeFile()
         } catch {
             stdout.fileHandleForReading.readabilityHandler = nil
             stderr.fileHandleForReading.readabilityHandler = nil
+            stdout.fileHandleForReading.closeFile()
+            stdout.fileHandleForWriting.closeFile()
+            stderr.fileHandleForReading.closeFile()
+            stderr.fileHandleForWriting.closeFile()
             return nil
         }
 
@@ -175,9 +181,15 @@ enum ProcessOutput {
 
         stdout.fileHandleForReading.readabilityHandler = nil
         stderr.fileHandleForReading.readabilityHandler = nil
-        guard exited else { return nil }
+        guard exited else {
+            stdout.fileHandleForReading.closeFile()
+            stderr.fileHandleForReading.closeFile()
+            return nil
+        }
         append(stdout.fileHandleForReading.readDataToEndOfFile())
         _ = stderr.fileHandleForReading.readDataToEndOfFile()
+        stdout.fileHandleForReading.closeFile()
+        stderr.fileHandleForReading.closeFile()
 
         guard !timedOut, process.terminationStatus == 0 else { return nil }
         lock.lock()
