@@ -63,7 +63,7 @@ struct Strings {
         titleCPU: "处理器", titlePower: "功率", titleRAM: "内存", titleFan: "散热", titleNet: "网络",
         titleStorage: "存储空间", titleBattery: "电池", titleAI: "AI 工具", titleProc: "活跃进程",
         subPower: "SoC 功率 · 系统功率 · 温度", subRAM: "统一内存 · 同活动监视器口径", subNet: "本机吞吐 · 进程流量",
-        subStorage: "Macintosh HD · 分类占用", subAI: "Codex · Claude 进程", subProc: "CPU / GPU 占用排名", subFanNone: "风扇由系统托管",
+        subStorage: "Macintosh HD · 分类占用", subAI: "Codex · Claude 进程", subProc: "CPU 占用排名", subFanNone: "风扇由系统托管",
         subFan: { "\($0) 风扇 · 系统自动调速" },
         cpuUser: "用户", cpuSystem: "系统", cpuIdle: "闲置",
         powerSystem: "系统功率", thermalStatus: "温度状态",
@@ -94,7 +94,7 @@ struct Strings {
         titleCPU: "CPU", titlePower: "Power", titleRAM: "Memory", titleFan: "Cooling", titleNet: "Network",
         titleStorage: "Storage", titleBattery: "Battery", titleAI: "AI Tools", titleProc: "Top Processes",
         subPower: "SoC power · system power · temp", subRAM: "Unified memory · like Activity Monitor", subNet: "Throughput · per-process",
-        subStorage: "Macintosh HD · by category", subAI: "Codex · Claude processes", subProc: "CPU / GPU usage", subFanNone: "Fans managed by macOS",
+        subStorage: "Macintosh HD · by category", subAI: "Codex · Claude processes", subProc: "By CPU usage", subFanNone: "Fans managed by macOS",
         subFan: { "\($0) fans · auto-managed" },
         cpuUser: "User", cpuSystem: "System", cpuIdle: "Idle",
         powerSystem: "System power", thermalStatus: "Thermal",
@@ -1314,12 +1314,9 @@ final class DashboardView: NSView {
     private func drawProcesses(_ s: MetricsSnapshot, rect: NSRect) {
         drawCard(rect)
         drawSectionTitle(S.titleProc, subtitle: S.subProc, rect: rect, glyph: .proc)
-        drawText(appLang == .en ? "CPU top 3" : "CPU 前三",
-                 in: NSRect(x: rect.minX + 18, y: rect.minY + 48, width: rect.width - 36, height: 14),
-                 size: 10.5, weight: .medium, color: textTertiary)
-        let items = Array(s.topProcesses.prefix(3))
+        let items = Array(s.topProcesses.prefix(5))
         let maxCPU = max(0.1, items.map { $0.cpu }.max() ?? 0.1)
-        var y = rect.minY + 68
+        var y = rect.minY + 50
         for item in items {
             drawText(item.name, in: NSRect(x: rect.minX + 18, y: y, width: rect.width - 92, height: 16),
                      font: NSFont.systemFont(ofSize: 12, weight: .regular), color: textPrimary)
@@ -1333,19 +1330,6 @@ final class DashboardView: NSView {
             procHue.setFill(); fg.fill()
             y += 29
         }
-
-        let gpuY = rect.minY + 170
-        drawText(appLang == .en ? "GPU top 3" : "GPU 前三",
-                 in: NSRect(x: rect.minX + 18, y: gpuY, width: rect.width - 36, height: 14),
-                 size: 10.5, weight: .medium, color: textTertiary)
-        drawMetricRow(appLang == .en ? "Per-process GPU" : "进程级 GPU",
-                      value: appLang == .en ? "needs sudo" : "需 sudo",
-                      dot: chGPU,
-                      rect: NSRect(x: rect.minX + 18, y: gpuY + 22, width: rect.width - 36, height: 16),
-                      valueColor: textTertiary)
-        let gpuNote = appLang == .en ? "Disabled to keep the app light and unprivileged" : "为保持轻量和无特权常驻，未启用"
-        drawText(gpuNote, in: NSRect(x: rect.minX + 18, y: gpuY + 44, width: rect.width - 36, height: 30),
-                 size: 10.5, weight: .regular, color: textTertiary)
     }
 
     // MARK: Chrome helpers
