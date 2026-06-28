@@ -462,7 +462,7 @@ final class MacmonBridge {
         let process = Process()
         let out = Pipe()
         process.executableURL = URL(fileURLWithPath: path)
-        process.arguments = ["pipe", "-i", "2000"]
+        process.arguments = ["pipe", "-i", "3000"]
         process.standardOutput = out
         process.standardError = Pipe()
         out.fileHandleForReading.readabilityHandler = { [weak self] handle in
@@ -528,7 +528,7 @@ final class NetTopReader {
                 if let apps = self?.sampleOnce() {
                     self?.lock.lock(); self?.cached = apps; self?.lock.unlock()
                 }
-                Thread.sleep(forTimeInterval: 3.0)
+                Thread.sleep(forTimeInterval: 10.0)
             }
         }
     }
@@ -657,7 +657,7 @@ final class MetricsProvider {
 
     func snapshot() -> MetricsSnapshot {
         let now = Date()
-        if now.timeIntervalSince(processReadTime) > 4 {
+        if now.timeIntervalSince(processReadTime) > 8 {
             if let data = Self.readProcesses() {
                 cachedProcesses = data.top
                 cachedMemApps = data.memApps
@@ -1729,7 +1729,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
 
         tick()
-        timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in self?.tick() }
+        timer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in self?.tick() }
     }
 
     func applicationWillTerminate(_ notification: Notification) { timer?.invalidate() }
