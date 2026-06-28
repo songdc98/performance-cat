@@ -34,7 +34,8 @@ enum BatteryCondition { case ac, onBattery, charging, unknown }
 struct Strings {
     var appName: String
     var starting: String
-    var statusCalm, statusThermal, statusCPU, statusPower, statusRAM: String
+    var statusEasy, statusCalm, statusWarm, statusHot, statusTooHot, statusExtreme: String
+    var statusCPU, statusPower, statusRAM: String
     var vitalRAM: String
     var titleCPU, titlePower, titleRAM, titleFan, titleNet, titleStorage, titleBattery, titleAI, titleProc: String
     var subPower, subRAM, subNet, subStorage, subAI, subProc, subFanNone: String
@@ -58,7 +59,8 @@ struct Strings {
     static let chinese = Strings(
         appName: "性能监测猫猫",
         starting: "性能监测猫猫正在启动…",
-        statusCalm: "运行平稳", statusThermal: "散热压力升高", statusCPU: "CPU 高负载", statusPower: "高功率运行", statusRAM: "内存压力偏高",
+        statusEasy: "轻松无压力", statusCalm: "运行平稳", statusWarm: "温和运行", statusHot: "高温运行", statusTooHot: "温度过高", statusExtreme: "压力极限",
+        statusCPU: "CPU 高负载", statusPower: "高功率运行", statusRAM: "内存压力偏高",
         vitalRAM: "内存",
         titleCPU: "处理器", titlePower: "功率", titleRAM: "内存", titleFan: "散热", titleNet: "网络",
         titleStorage: "存储空间", titleBattery: "电池", titleAI: "AI 工具", titleProc: "活跃进程",
@@ -89,7 +91,8 @@ struct Strings {
     static let english = Strings(
         appName: "Performance Cat",
         starting: "Performance Cat is starting…",
-        statusCalm: "All clear", statusThermal: "Thermal pressure", statusCPU: "High CPU load", statusPower: "High power draw", statusRAM: "Memory pressure",
+        statusEasy: "Barely working", statusCalm: "All clear", statusWarm: "Warm cruise", statusHot: "Hot run", statusTooHot: "Too hot", statusExtreme: "Limit pressure",
+        statusCPU: "High CPU load", statusPower: "High power draw", statusRAM: "Memory pressure",
         vitalRAM: "RAM",
         titleCPU: "CPU", titlePower: "Power", titleRAM: "Memory", titleFan: "Cooling", titleNet: "Network",
         titleStorage: "Storage", titleBattery: "Battery", titleAI: "AI Tools", titleProc: "Top Processes",
@@ -517,6 +520,9 @@ final class MacmonBridge {
 final class NetTopReader {
     private let queue = DispatchQueue(label: "local.song.performance-cat.nettop")
     private var cached: [NetworkApp] = []
+    private var previousTotals: [String: (UInt64, UInt64)]?
+    private var previousTime: Date?
+    private var lastNonEmpty = Date.distantPast
     private let lock = NSLock()
     private var running = true
 
@@ -531,51 +537,63 @@ final class NetTopReader {
     private func loop() {
         queue.async { [weak self] in
             while self?.running == true {
-                if let apps = self?.sampleOnce() {
-                    self?.lock.lock(); self?.cached = apps; self?.lock.unlock()
+                if let totals = self?.sampleTotals() {
+                    self?.updateCache(with: totals)
                 }
-                Thread.sleep(forTimeInterval: 10.0)
+                Thread.sleep(forTimeInterval: 8.0)
             }
         }
     }
 
-    // Two cumulative frames 1s apart; per-process delta = bytes/second.
-    private func sampleOnce() -> [NetworkApp]? {
+    private func sampleTotals() -> [String: (UInt64, UInt64)]? {
         guard let text = ProcessOutput.string(
             "/usr/bin/nettop",
-            ["-P", "-x", "-L", "2", "-s", "1", "-J", "bytes_in,bytes_out"],
-            timeout: 5.0
+            ["-P", "-x", "-L", "1", "-J", "bytes_in,bytes_out"],
+            timeout: 9.0
         ) else { return nil }
-        return Self.parse(text)
+        return Self.parseTotals(text)
     }
 
-    private static func parse(_ text: String) -> [NetworkApp] {
-        var frames: [[String: (UInt64, UInt64)]] = []
-        var current: [String: (UInt64, UInt64)] = [:]
+    private func updateCache(with totals: [String: (UInt64, UInt64)]) {
+        let now = Date()
+        defer {
+            previousTotals = totals
+            previousTime = now
+        }
+        guard let previousTotals, let previousTime else { return }
+        let elapsed = max(1.0, now.timeIntervalSince(previousTime))
+        var apps: [NetworkApp] = []
+        for (name, late) in totals {
+            guard let early = previousTotals[name] else { continue }
+            let down = late.0 >= early.0 ? Double(late.0 - early.0) / elapsed : 0
+            let up = late.1 >= early.1 ? Double(late.1 - early.1) / elapsed : 0
+            if down + up > 0 { apps.append(NetworkApp(name: name, downPerSecond: down, upPerSecond: up)) }
+        }
+        apps.sort { ($0.downPerSecond + $0.upPerSecond) > ($1.downPerSecond + $1.upPerSecond) }
+
+        lock.lock()
+        if !apps.isEmpty {
+            cached = apps
+            lastNonEmpty = now
+        } else if now.timeIntervalSince(lastNonEmpty) > 45 {
+            cached = []
+        }
+        lock.unlock()
+    }
+
+    private static func parseTotals(_ text: String) -> [String: (UInt64, UInt64)] {
+        var totals: [String: (UInt64, UInt64)] = [:]
         for line in text.split(separator: "\n") {
             let cols = line.split(separator: ",", omittingEmptySubsequences: false).map(String.init)
             if cols.count < 3 { continue }
-            if cols[1] == "bytes_in" { // frame header
-                if !current.isEmpty { frames.append(current); current = [:] }
-                continue
-            }
+            if cols[1] == "bytes_in" { continue }
             guard let inB = UInt64(cols[1]), let outB = UInt64(cols[2]) else { continue }
             let name = cleanName(cols[0])
-            let existing = current[name] ?? (0, 0)
-            current[name] = (existing.0 + inB, existing.1 + outB)
+            guard !name.isEmpty else { continue }
+            let existing = totals[name] ?? (0, 0)
+            totals[name] = (existing.0 + inB, existing.1 + outB)
         }
-        if !current.isEmpty { frames.append(current) }
-        guard frames.count >= 2 else { return [] }
-        let first = frames[frames.count - 2]
-        let second = frames[frames.count - 1]
-        var apps: [NetworkApp] = []
-        for (name, late) in second {
-            let early = first[name] ?? (0, 0)
-            let down = late.0 >= early.0 ? Double(late.0 - early.0) : 0
-            let up = late.1 >= early.1 ? Double(late.1 - early.1) : 0
-            if down + up > 0 { apps.append(NetworkApp(name: name, downPerSecond: down, upPerSecond: up)) }
-        }
-        return apps.sorted { ($0.downPerSecond + $0.upPerSecond) > ($1.downPerSecond + $1.upPerSecond) }
+        return totals
     }
 
     private static func cleanName(_ raw: String) -> String {
@@ -969,12 +987,6 @@ final class DashboardView: NSView {
     private var powerHistory: [Double] = []
     private var netHistory: [Double] = []
     private let maxHistory = 80
-    private lazy var appIcon: NSImage? = {
-        if let url = Bundle.main.url(forResource: "AppIcon", withExtension: "icns") {
-            return NSImage(contentsOf: url)
-        }
-        return NSApp.applicationIconImage
-    }()
 
     // We render the whole dashboard into an offscreen bitmap and hand it to the view's
     // layer as `contents`. Drawing this complex content directly into the window's
@@ -1074,9 +1086,9 @@ final class DashboardView: NSView {
         drawPower(snapshot, rect: NSRect(x: x1, y: y0, width: colW, height: row1H))
         drawFans(snapshot, rect: NSRect(x: x2, y: y0, width: colW, height: row1H))
         drawMemory(snapshot, rect: NSRect(x: x0, y: y1, width: colW, height: row2H))
-        drawNetwork(snapshot, rect: NSRect(x: x1, y: y1, width: colW, height: row2H))
+        drawBattery(snapshot, rect: NSRect(x: x1, y: y1, width: colW, height: row2H))
         drawAI(snapshot, rect: NSRect(x: x2, y: y1, width: colW, height: row2H))
-        drawBattery(snapshot, rect: NSRect(x: x0, y: y2, width: colW, height: row3H))
+        drawNetwork(snapshot, rect: NSRect(x: x0, y: y2, width: colW, height: row3H))
         drawStorage(snapshot, rect: NSRect(x: x1, y: y2, width: colW, height: row3H))
         drawProcesses(snapshot, rect: NSRect(x: x2, y: y2, width: colW, height: row3H))
     }
@@ -1095,22 +1107,38 @@ final class DashboardView: NSView {
     private func statusSeverity(_ s: MetricsSnapshot) -> Severity {
         let ramRatio = s.memory.ratio
         let power = s.sensors.allPowerW ?? componentPower(s.sensors) ?? s.sensors.systemPowerW ?? 0
-        if s.thermalState == .critical { return Severity(word: S.statusThermal, color: crit) }
-        if s.thermalState == .serious { return Severity(word: S.statusThermal, color: warn) }
-        if s.cpu.active > 0.75 { return Severity(word: S.statusCPU, color: warn) }
-        if power > 70 { return Severity(word: S.statusPower, color: warn) }
-        if ramRatio > 0.80 { return Severity(word: S.statusRAM, color: warn) }
+        let hottest = [s.sensors.cpuTempC, s.sensors.gpuTempC].compactMap { $0 }.max() ?? 0
+        if s.thermalState == .critical || hottest >= 92 || ramRatio >= 0.94 {
+            return Severity(word: S.statusExtreme, color: crit)
+        }
+        if hottest >= 84 || s.thermalState == .serious {
+            return Severity(word: S.statusTooHot, color: crit)
+        }
+        if hottest >= 74 {
+            return Severity(word: S.statusHot, color: warn)
+        }
+        if s.cpu.active > 0.82 {
+            return Severity(word: S.statusCPU, color: cpuHue)
+        }
+        if power > 85 {
+            return Severity(word: S.statusPower, color: accent)
+        }
+        if ramRatio > 0.84 {
+            return Severity(word: S.statusRAM, color: ramHue)
+        }
+        if power > 55 || hottest >= 62 || s.cpu.active > 0.45 {
+            return Severity(word: S.statusWarm, color: pwrHue)
+        }
+        if s.cpu.active < 0.16 && power < 28 && ramRatio < 0.72 && hottest < 55 {
+            return Severity(word: S.statusEasy, color: ok)
+        }
         return Severity(word: S.statusCalm, color: ok)
     }
 
     private func drawHeader(_ s: MetricsSnapshot, rect: NSRect) {
         drawCard(rect)
         let sev = statusSeverity(s)
-        // App icon (brand mark) at the far left of the header.
-        let iconSize: CGFloat = 22
-        let iconRect = NSRect(x: rect.minX + 14, y: rect.midY - iconSize / 2, width: iconSize, height: iconSize)
-        appIcon?.draw(in: iconRect, from: .zero, operation: .sourceOver, fraction: 1)
-        let statusX = iconRect.maxX + 11
+        let statusX = rect.minX + 18
         let dotR: CGFloat = 7
         let dot = NSBezierPath(ovalIn: NSRect(x: statusX, y: rect.midY - dotR / 2, width: dotR, height: dotR))
         sev.color.setFill(); dot.fill()
@@ -1291,9 +1319,12 @@ final class DashboardView: NSView {
         drawText(S.netTop3, in: NSRect(x: rect.minX + 18, y: rect.minY + 138, width: rect.width - 36, height: 14),
                  size: 10.5, weight: .regular, color: textTertiary)
         var y = rect.minY + 158
-        let apps = s.networkApps.prefix(3)
-        if apps.isEmpty {
-            drawText(S.netNone, in: NSRect(x: rect.minX + 18, y: y, width: rect.width - 36, height: 16), size: 12, weight: .regular, color: textSecondary)
+        let step: CGFloat = 22
+        let maxRows = max(0, min(3, Int((rect.maxY - y - 14) / step)))
+        let apps = s.networkApps.prefix(maxRows)
+        if s.networkApps.isEmpty || maxRows == 0 {
+            let hasTraffic = s.network.downPerSecond + s.network.upPerSecond > 512
+            drawText(hasTraffic ? S.measuring : S.netNone, in: NSRect(x: rect.minX + 18, y: y, width: rect.width - 36, height: 16), size: 12, weight: .regular, color: textSecondary)
         }
         for app in apps {
             drawText(app.name, in: NSRect(x: rect.minX + 18, y: y, width: rect.width * 0.42, height: 16),
@@ -1301,7 +1332,7 @@ final class DashboardView: NSView {
             let value = "↓\(shortRate(app.downPerSecond)) ↑\(shortRate(app.upPerSecond))"
             drawText(value, in: NSRect(x: rect.midX - 20, y: y, width: rect.width / 2 + 2, height: 16),
                      font: tabFont(12, .medium), color: textSecondary, align: .right)
-            y += 22
+            y += step
         }
     }
 
