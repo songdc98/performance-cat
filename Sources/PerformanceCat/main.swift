@@ -1757,12 +1757,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let provider = MetricsProvider()
     private var timer: Timer?
     private var isSampling = false
+    private var backgroundModeItem: NSMenuItem?
+    private var savedWindowFrame: NSRect?
+    private var isBackgroundMode = false
+    private let normalStyle: NSWindow.StyleMask = [.titled, .closable, .miniaturizable, .resizable]
+    private let backgroundModeKey = "PerformanceCatBackgroundMode"
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
+        installMenu()
         window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 1040, height: 880),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            styleMask: normalStyle,
             backing: .buffered,
             defer: false
         )
@@ -1775,14 +1781,111 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         dashboard.layerContentsRedrawPolicy = .never
         window.contentView = dashboard
         window.center()
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        savedWindowFrame = window.frame
+        if UserDefaults.standard.bool(forKey: backgroundModeKey) {
+            setBackgroundMode(true, persist: false)
+        } else {
+            window.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+        }
 
         tick()
         timer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in self?.tick() }
     }
 
     func applicationWillTerminate(_ notification: Notification) { timer?.invalidate() }
+
+    private func installMenu() {
+        let mainMenu = NSMenu()
+        let appMenuItem = NSMenuItem()
+        mainMenu.addItem(appMenuItem)
+
+        let appMenu = NSMenu(title: S.appName)
+        appMenuItem.submenu = appMenu
+
+        let backgroundItem = NSMenuItem(title: backgroundMenuTitle(enabled: false), action: #selector(toggleBackgroundMode(_:)), keyEquivalent: "b")
+        backgroundItem.keyEquivalentModifierMask = [.command]
+        backgroundItem.target = self
+        appMenu.addItem(backgroundItem)
+        appMenu.addItem(.separator())
+
+        let quitTitle = appLang == .en ? "Quit Performance Cat" : "退出性能监测猫猫"
+        appMenu.addItem(NSMenuItem(title: quitTitle, action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+
+        NSApp.mainMenu = mainMenu
+        backgroundModeItem = backgroundItem
+        updateBackgroundMenu()
+    }
+
+    @objc private func toggleBackgroundMode(_ sender: Any?) {
+        setBackgroundMode(!isBackgroundMode, persist: true)
+    }
+
+    private func setBackgroundMode(_ enabled: Bool, persist: Bool) {
+        guard window != nil else { return }
+        if persist { UserDefaults.standard.set(enabled, forKey: backgroundModeKey) }
+
+        if enabled {
+            if !isBackgroundMode { savedWindowFrame = window.frame }
+            let targetScreen = builtInScreen() ?? window.screen ?? NSScreen.main ?? NSScreen.screens.first
+            isBackgroundMode = true
+            window.orderOut(nil)
+            window.styleMask = [.borderless]
+            window.minSize = NSSize(width: 320, height: 240)
+            window.hasShadow = false
+            window.ignoresMouseEvents = true
+            window.level = desktopBackgroundLevel()
+            window.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle, .fullScreenAuxiliary]
+            if let screen = targetScreen {
+                window.setFrame(screen.frame, display: true)
+            }
+            window.orderBack(nil)
+        } else {
+            isBackgroundMode = false
+            window.orderOut(nil)
+            window.styleMask = normalStyle
+            window.minSize = NSSize(width: 880, height: 800)
+            window.titlebarAppearsTransparent = true
+            window.hasShadow = true
+            window.ignoresMouseEvents = false
+            window.level = .normal
+            window.collectionBehavior = []
+            if let frame = savedWindowFrame, frame.width >= 880, frame.height >= 800 {
+                window.setFrame(frame, display: true)
+            } else {
+                window.setFrame(NSRect(x: 0, y: 0, width: 1040, height: 880), display: true)
+                window.center()
+                savedWindowFrame = window.frame
+            }
+            window.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+        }
+        updateBackgroundMenu()
+    }
+
+    private func desktopBackgroundLevel() -> NSWindow.Level {
+        let raw = Int(CGWindowLevelForKey(.desktopIconWindow)) - 1
+        return NSWindow.Level(rawValue: raw)
+    }
+
+    private func builtInScreen() -> NSScreen? {
+        for screen in NSScreen.screens {
+            guard let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else { continue }
+            let displayID = CGDirectDisplayID(number.uint32Value)
+            if CGDisplayIsBuiltin(displayID) != 0 { return screen }
+        }
+        return nil
+    }
+
+    private func updateBackgroundMenu() {
+        backgroundModeItem?.state = isBackgroundMode ? .on : .off
+        backgroundModeItem?.title = backgroundMenuTitle(enabled: isBackgroundMode)
+    }
+
+    private func backgroundMenuTitle(enabled: Bool) -> String {
+        if appLang == .en { return enabled ? "Exit Background Mode" : "Background Mode" }
+        return enabled ? "退出置底背景模式" : "置底背景模式"
+    }
 
     private func tick() {
         guard !isSampling else { return }

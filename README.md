@@ -12,7 +12,7 @@ It is built with plain **AppKit in a single Swift file**. No Electron, no web
 view, no background daemon, no network access, no analytics, no language switcher
 inside the app. It only *reads* local system metrics and draws them.
 
-> Footprint: the app idles at roughly **1% CPU** and a flat **~70 MB** of memory
+> Footprint: the app idles at roughly **0-1% CPU** and a flat **~130-160 MB** of memory
 > (the figure Activity Monitor shows); the bundled `macmon` sensor helper adds
 > about **1% CPU and ~6 MB**. The dashboard is rendered once per refresh into an
 > offscreen bitmap and shown through the view's layer, so memory stays flat
@@ -45,6 +45,7 @@ Every value is labeled so you always know what you are looking at.
 | **Battery** | Charge %, charge/discharge wattage, adapter wattage, cycle count |
 | **AI Tools** | For any running `codex` / `claude` processes: **CPU %, memory, helper-process count, and how long the app has been running** |
 | **Top Processes** | The processes currently using the most CPU |
+| **Background Mode** | `⌘B` turns the dashboard into a full-screen desktop-level background on the built-in display; it stays below normal windows and ignores mouse clicks |
 
 The header strip shows a one-line status (All clear / High CPU load / Thermal
 pressure …) with the key vitals (SoC power, CPU/GPU temperature, memory %).
@@ -58,6 +59,8 @@ fabricates data:
 
 - **CPU / memory / network throughput / battery** — Apple system APIs
   (`host_processor_info`, `host_statistics64`, `getifaddrs`, IOKit power sources).
+- **Per-process memory** — `proc_pid_rusage` physical footprint, closer to
+  Activity Monitor's Memory column than RSS.
 - **Fan RPM** — read directly from the **SMC** via IOKit (`AppleSMC`). Read-only,
   no privileges. When the Mac is cool the fans are genuinely off, so it honestly
   shows `0 RPM`.
