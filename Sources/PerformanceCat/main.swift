@@ -987,6 +987,7 @@ final class DashboardView: NSView {
     private var powerHistory: [Double] = []
     private var netHistory: [Double] = []
     private let maxHistory = 80
+    private let maxRenderPixels: CGFloat = 5_000_000
 
     // We render the whole dashboard into an offscreen bitmap and hand it to the view's
     // layer as `contents`. Drawing this complex content directly into the window's
@@ -1030,7 +1031,9 @@ final class DashboardView: NSView {
     private func renderToLayer() {
         let size = bounds.size
         guard size.width > 1, size.height > 1 else { return }
-        let scale = window?.backingScaleFactor ?? 2
+        let backingScale = window?.backingScaleFactor ?? 2
+        let pointArea = max(1, size.width * size.height)
+        let scale = max(1, min(backingScale, sqrt(maxRenderPixels / pointArea)))
         let pw = Int(size.width * scale), ph = Int(size.height * scale)
         guard pw > 0, ph > 0 else { return }
         autoreleasepool {
