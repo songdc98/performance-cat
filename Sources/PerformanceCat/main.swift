@@ -70,7 +70,7 @@ struct Strings {
         thermalText: { switch $0 { case .nominal: return "正常"; case .fair: return "温和"; case .serious: return "偏热"; case .critical: return "临界"; case .unknown: return "未知" } },
         fanLabel: { "风扇 \($0)" },
         fanStatus: "状态", fanNoteIdle: "低温停转 · 由系统按温度自动调速", fanNoteLive: "实测转速 · 由系统按温度自动调速", fanNoneNote: "此机型未暴露风扇转速（或无风扇）",
-        memPressure: "压力", memFree: "可用", memTop3: "内存占用前三（进程/应用）", measuring: "统计中…",
+        memPressure: "压力", memFree: "可用", memTop3: "内存来源（估算）", measuring: "统计中…",
         netTop3: "流量占用前三（进程，每秒）", netNone: "暂无明显进程流量",
         storSystem: "系统", storData: "数据", storOther: "其他", storFree: "可用",
         storFreeOfTotal: { "可用 / 共 \($0)" },
@@ -101,7 +101,7 @@ struct Strings {
         thermalText: { switch $0 { case .nominal: return "Nominal"; case .fair: return "Fair"; case .serious: return "Serious"; case .critical: return "Critical"; case .unknown: return "Unknown" } },
         fanLabel: { "Fan \($0)" },
         fanStatus: "Status", fanNoteIdle: "Idle (cool) · system auto-managed", fanNoteLive: "Live RPM · system auto-managed", fanNoneNote: "No fan sensor on this Mac (or fanless)",
-        memPressure: "Pressure", memFree: "Free", memTop3: "Top 3 by memory (process/app)", measuring: "Measuring…",
+        memPressure: "Pressure", memFree: "Free", memTop3: "Memory sources (est.)", measuring: "Measuring…",
         netTop3: "Top 3 processes by traffic (per sec)", netNone: "No notable process traffic",
         storSystem: "System", storData: "Data", storOther: "Other", storFree: "Free",
         storFreeOfTotal: { "free / \($0) total" },
@@ -212,8 +212,14 @@ struct MemoryStats {
     var used: UInt64
     var total: UInt64
     var swapUsed: UInt64?
+    var processRSS: UInt64
+    var compressed: UInt64
+    var wired: UInt64
     var ratio: Double { total == 0 ? 0 : Double(used) / Double(total) }
     var free: UInt64 { total > used ? total - used : 0 }
+    var unassigned: UInt64 {
+        used > processRSS ? used - processRSS : 0
+    }
 }
 
 struct AppUsage {
@@ -646,6 +652,7 @@ final class MetricsProvider {
     private var cachedProcesses: [ProcessStats] = []
     private var cachedMemApps: [AppUsage] = []
     private var cachedAIUsage = AIUsage()
+    private var cachedProcessRSS: UInt64 = 0
     private var processReadTime = Date.distantPast
     private let chipName: String
     private let macmon = MacmonBridge()
@@ -662,6 +669,7 @@ final class MetricsProvider {
                 cachedProcesses = data.top
                 cachedMemApps = data.memApps
                 cachedAIUsage = data.ai
+                cachedProcessRSS = data.processRSS
             }
             processReadTime = now
         }
@@ -669,7 +677,7 @@ final class MetricsProvider {
             timestamp: now,
             chipName: chipName,
             cpu: readCPU(),
-            memory: readMemory(),
+            memory: readMemory(processRSS: cachedProcessRSS),
             network: readNetwork(),
             battery: Self.readBattery(),
             thermalState: Self.thermalStateText(),
@@ -729,7 +737,7 @@ final class MetricsProvider {
 
     private func delta(_ current: UInt64, _ previous: UInt64) -> UInt64 { current >= previous ? current - previous : 0 }
 
-    private func readMemory() -> MemoryStats {
+    private func readMemory(processRSS: UInt64) -> MemoryStats {
         var stats = vm_statistics64()
         var count = mach_msg_type_number_t(MemoryLayout<vm_statistics64_data_t>.stride / MemoryLayout<integer_t>.stride)
         let result = withUnsafeMutablePointer(to: &stats) {
@@ -740,17 +748,24 @@ final class MetricsProvider {
         let total = ProcessInfo.processInfo.physicalMemory
         let sensors = macmon.latest()
         var used: UInt64 = 0
+        var compressed: UInt64 = 0
+        var wired: UInt64 = 0
         if let macmonUsed = sensors.ramUsedBytes, macmonUsed > 0 {
             used = min(total, macmonUsed)
-        } else if result == KERN_SUCCESS {
+        }
+        if result == KERN_SUCCESS {
             var pageSize = vm_size_t(0)
             host_page_size(mach_host_self(), &pageSize)
             let page = UInt64(pageSize)
-            let computed = (UInt64(stats.active_count) + UInt64(stats.wire_count) + UInt64(stats.compressor_page_count)) * page
-            used = min(total, computed)
+            compressed = UInt64(stats.compressor_page_count) * page
+            wired = UInt64(stats.wire_count) * page
+            if used == 0 {
+                let computed = (UInt64(stats.active_count) + UInt64(stats.wire_count) + UInt64(stats.compressor_page_count)) * page
+                used = min(total, computed)
+            }
         }
         let swap = sensors.swapBytes ?? Self.readSwapUsage()
-        return MemoryStats(used: used, total: total, swapUsed: swap)
+        return MemoryStats(used: used, total: total, swapUsed: swap, processRSS: processRSS, compressed: compressed, wired: wired)
     }
 
     private static func readSwapUsage() -> UInt64? {
@@ -845,30 +860,32 @@ final class MetricsProvider {
     }
 
     // Reads ps once and derives: top CPU processes, the top memory-using apps, and AI-tool usage.
-    private static func readProcesses() -> (top: [ProcessStats], memApps: [AppUsage], ai: AIUsage)? {
-        guard let output = ProcessOutput.string("/bin/ps", ["-axo", "pcpu=,rss=,etime=,comm="], timeout: 2.0) else { return nil }
+    private static func readProcesses() -> (top: [ProcessStats], memApps: [AppUsage], ai: AIUsage, processRSS: UInt64)? {
+        guard let output = ProcessOutput.string("/bin/ps", ["-axo", "pcpu=,rss=,etime=,pid=,command="], timeout: 2.0) else { return nil }
 
         var processes: [ProcessStats] = []
         var ai = AIUsage()
+        var processRSS: UInt64 = 0
         // Aggregate by application bundle (so an app's helpers sum together).
         var apps: [String: (rss: UInt64, cpu: Double, isUserApp: Bool)] = [:]
 
         for line in output.split(separator: "\n") {
-            // Fields: pcpu rss etime path. etime ("[[dd-]hh:]mm:ss") has no spaces; the path may.
-            let parts = line.split(separator: " ", maxSplits: 3, omittingEmptySubsequences: true)
-            guard parts.count == 4, let cpu = Double(parts[0]), let rssKB = UInt64(parts[1]) else { continue }
+            // Fields: pcpu rss etime pid command. etime ("[[dd-]hh:]mm:ss") has no spaces; the command may.
+            let parts = line.split(separator: " ", maxSplits: 4, omittingEmptySubsequences: true)
+            guard parts.count == 5, let cpu = Double(parts[0]), let rssKB = UInt64(parts[1]) else { continue }
             let uptime = parseETime(String(parts[2]))
-            let path = String(parts[3])
+            let command = String(parts[4])
             let memory = rssKB * 1024
-            let procName = URL(fileURLWithPath: path).lastPathComponent
+            processRSS += memory
+            let procName = displayName(for: command)
             processes.append(ProcessStats(name: procName, cpu: cpu))
 
-            let lower = path.lowercased()
+            let lower = command.lowercased()
             if lower.contains("codex") { accumulate(&ai.codex, cpu: cpu, memory: memory, uptime: uptime) }
             if lower.contains("claude") { accumulate(&ai.claude, cpu: cpu, memory: memory, uptime: uptime) }
 
-            let app = appName(for: path)
-            let isUserApp = path.contains("/Applications/")
+            let app = displayName(for: command)
+            let isUserApp = command.contains("/Applications/")
             var entry = apps[app] ?? (0, 0, false)
             entry.rss += memory; entry.cpu += cpu; entry.isUserApp = entry.isUserApp || isUserApp
             apps[app] = entry
@@ -882,7 +899,7 @@ final class MetricsProvider {
             .sorted { $0.value.rss > $1.value.rss }.prefix(3)
             .map { AppUsage(name: $0.key, rss: $0.value.rss, cpu: $0.value.cpu) }
 
-        return (top, memApps, ai)
+        return (top, memApps, ai, processRSS)
     }
 
     private static func accumulate(_ tool: inout AIToolUsage, cpu: Double, memory: UInt64, uptime: Int) {
@@ -911,12 +928,22 @@ final class MetricsProvider {
         return days * 86400 + h * 3600 + m * 60 + sec
     }
 
-    private static func appName(for path: String) -> String {
-        if let range = path.range(of: ".app/") {
-            let bundlePath = String(path[..<range.lowerBound]) + ".app"
+    private static func displayName(for command: String) -> String {
+        if let range = command.range(of: ".app/") {
+            let bundlePath = String(command[..<range.lowerBound]) + ".app"
             return URL(fileURLWithPath: bundlePath).deletingPathExtension().lastPathComponent
         }
-        return URL(fileURLWithPath: path).lastPathComponent
+        let tokens = command.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
+        if let script = tokens.first(where: {
+            let lower = $0.lowercased()
+            return lower.hasSuffix(".py") || lower.hasSuffix(".r") || lower.hasSuffix(".sh") ||
+                lower.hasSuffix(".js") || lower.hasSuffix(".ts") || lower.hasSuffix(".jl") ||
+                lower.hasSuffix(".swift")
+        }) {
+            return URL(fileURLWithPath: script).lastPathComponent
+        }
+        guard let first = tokens.first else { return "—" }
+        return URL(fileURLWithPath: first).lastPathComponent
     }
 }
 
@@ -1202,14 +1229,39 @@ final class DashboardView: NSView {
 
         drawText(S.memTop3, in: NSRect(x: rect.minX + 18, y: rect.minY + 144, width: rect.width - 36, height: 14),
                  size: 10.5, weight: .regular, color: textTertiary)
-        var y = rect.minY + 164
-        if s.topMemoryApps.isEmpty {
+        let processLabel = appLang == .en ? "Process RSS total" : "进程RSS合计"
+        let gapLabel = appLang == .en ? "System/shared gap" : "系统/共享差额"
+        let fixedLabel = appLang == .en ? "Compressed / wired" : "压缩 / 固定"
+        let topLabel = appLang == .en ? "Top RSS" : "占用前三（RSS）"
+
+        var y = rect.minY + 162
+        let rowH: CGFloat = 15
+        let step: CGFloat = 18
+        drawMetricRow(processLabel, value: s.memory.processRSS > 0 ? formatBytes(s.memory.processRSS) : S.measuring, dot: ramHue,
+                      rect: NSRect(x: rect.minX + 18, y: y, width: rect.width - 36, height: rowH))
+        y += step
+        drawMetricRow(gapLabel, value: s.memory.processRSS > 0 ? formatBytes(s.memory.unassigned) : "—", dot: warn,
+                      rect: NSRect(x: rect.minX + 18, y: y, width: rect.width - 36, height: rowH))
+        y += step
+        if rect.height > 245 {
+            let fixedValue = (s.memory.compressed > 0 || s.memory.wired > 0) ? "\(formatBytes(s.memory.compressed)) / \(formatBytes(s.memory.wired))" : "—"
+            drawMetricRow(fixedLabel, value: fixedValue, dot: textTertiary,
+                          rect: NSRect(x: rect.minX + 18, y: y, width: rect.width - 36, height: rowH))
+            y += step
+        }
+
+        y += 7
+        drawText(topLabel, in: NSRect(x: rect.minX + 18, y: y, width: rect.width - 36, height: 14),
+                 size: 10.5, weight: .regular, color: textTertiary)
+        y += 18
+        let maxRows = max(0, min(3, Int((rect.maxY - y - 14) / step)))
+        if s.topMemoryApps.isEmpty || maxRows == 0 {
             drawText(S.measuring, in: NSRect(x: rect.minX + 18, y: y, width: rect.width - 36, height: 16), size: 12, weight: .regular, color: textTertiary)
         }
-        for app in s.topMemoryApps.prefix(3) {
+        for app in s.topMemoryApps.prefix(maxRows) {
             drawMetricRow(app.name, value: formatBytes(app.rss), dot: ramHue,
-                          rect: NSRect(x: rect.minX + 18, y: y, width: rect.width - 36, height: 16))
-            y += 22
+                          rect: NSRect(x: rect.minX + 18, y: y, width: rect.width - 36, height: rowH))
+            y += step
         }
     }
 
